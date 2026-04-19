@@ -3,127 +3,154 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
+#include <WiFiUdp.h>
 
-// WiFi credentials
-const char* ssid = "ssid";
-const char* password = "password";
+// ── Configuration ────────────────────────────────────────────────────────────
+const char* WIFI_SSID       = "xxxxxxx";
+const char* WIFI_PASSWORD   = "xxxxxxx";
 
-// Server config
-const char* serverUrl = "http://<server-ip>:8000/sensors";
-const char* clientSecret = "mysecret";
-const char* deviceId = "esp8266d1-ds18b20-01";
+const char* SERVER_DOMAIN   = "labpc.home";
+const char* SERVER_PATH     = "/sensors";
+const int   SERVER_PORT     = 8000;
 
-// DS18B20 on GPIO14 (D5 on Wemos D1 Mini)
-const int oneWireBus = 14;
-OneWire oneWire(oneWireBus);
+const char* CLIENT_SECRET   = "ce0eb3fe21a3a17b21cc";
+const char* DEVICE_ID       = "esp8266d1-ds18b20-01";
+
+const int   TEMP_PIN        = 14;   // GPIO14 = D5 on Wemos D1 Mini
+const int   LOOP_DELAY_MS   = 300000; //every 5 minutes
+// ─────────────────────────────────────────────────────────────────────────────
+
+OneWire oneWire(TEMP_PIN);
 DallasTemperature sensors(&oneWire);
-
 WiFiClient wifiClient;
 
 
-void setup() {
-  Serial.begin(115200);
-  delay(100);
-  Serial.println("\n\n=== ESP8266 DS18B20 HTTP POST ===");
+// ── DNS Diag──────────────────────────────────────────────────────────────────
+void rawDnsTest() {
+  WiFiUDP udp;
+  udp.begin(12345);
 
-  // Connect WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  Serial.println("Waiting for network stack to settle...");
+  // Minimal DNS query for your hostname
+  // Change "yourserver" to match your actual hostname
+  const char* hostname = "labpc.home";
+  uint8_t query[29] = {
+    0x00, 0x01,  // Transaction ID
+    0x01, 0x00,  // Flags: standard query
+    0x00, 0x01,  // Questions: 1
+    0x00, 0x00,  // Answer RRs: 0
+    0x00, 0x00,  // Authority RRs: 0
+    0x00, 0x00,  // Additional RRs: 0
+  };
+
+  // This is a simplified test — just check if Pi-hole responds at all
+  udp.beginPacket(WiFi.dnsIP(), 53);
+  udp.write(query, sizeof(query));
+  int sent = udp.endPacket();
+  Serial.printf("[RAW DNS] Packet sent: %d\n", sent);
+
   delay(2000);
+  int size = udp.parsePacket();
+  Serial.printf("[RAW DNS] Response size: %d bytes\n", size);
+  if (size > 0) {
+    uint8_t buf[64];
+    udp.read(buf, size);
+    Serial.printf("[RAW DNS] Response size: %d bytes\n", size);
+    // Print response flags (byte 3 contains rcode)
+    Serial.printf("[RAW DNS] Flags: 0x%02X%02X\n", buf[2], buf[3]);
+    Serial.printf("[RAW DNS] RCODE: %d\n", buf[3] & 0x0F);
+    // RCODE 0 = success, 1 = format error, 2 = server fail, 3 = NXDOMAIN
+  } else {
+    Serial.println("[RAW DNS] No response — Pi-hole not reachable on UDP port 53");
+  }
+  udp.stop();
+}
+
+
+// ── WiFi ─────────────────────────────────────────────────────────────────────
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println();
-  Serial.print("Connected! IP: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("Subnet: ");
-  Serial.println(WiFi.subnetMask());
-  Serial.print("Gateway: ");
-  Serial.println(WiFi.gatewayIP());
-
-  sensors.begin();
-
-  // Verify sensor is found
-  int deviceCount = sensors.getDeviceCount();
-  Serial.print("DS18B20 devices found: ");
-  Serial.println(deviceCount);
-  if (deviceCount == 0) {
-    Serial.println("WARNING: No DS18B20 detected. Check wiring on GPIO14 (D5).");
-  }
+  Serial.printf("Connected! IP: %s  DNS: %s\n",
+    WiFi.localIP().toString().c_str(),
+    WiFi.dnsIP().toString().c_str());
 }
 
+// ── DNS ──────────────────────────────────────────────────────────────────────
+bool resolveHost(IPAddress& out) {
+  // Give lwIP time to actually process the response
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    int result = WiFi.hostByName(SERVER_DOMAIN, out, 10000);  // 10s timeout
+    if (result == 1) {
+      Serial.printf("[DNS] %s → %s\n", SERVER_DOMAIN, out.toString().c_str());
+      return true;
+    }
+    Serial.printf("[DNS] Attempt %d result code: %d\n", attempt, result);
+    delay(2000);
+    yield();  // let lwIP process pending packets
+  }
+  return false;
+}
+// ── HTTP POST ────────────────────────────────────────────────────────────────
 void postTemperature(float tempC) {
-  // Direct TCP test to confirm reachability
-  Serial.print("[DEBUG] Free heap: ");
-  Serial.println(ESP.getFreeHeap());
+  IPAddress ip;
+  if (!resolveHost(ip)) return;
 
-  Serial.print("[DEBUG] TCP test to 172.16.0.15:8000... ");
-  if (wifiClient.connect("172.16.0.15", 8000)) {
-    Serial.println("OK");
-    wifiClient.stop();  // close the test connection
-    delay(100);
-  } else {
-    Serial.println("FAILED — server unreachable at TCP level");
-    return;
-  }
+  String url = "http://" + ip.toString() + ":" + SERVER_PORT + SERVER_PATH;
 
-  HTTPClient http;
-  http.setTimeout(10000);  // 10s timeout, default 5s can be tight
-
-  // begin() with WiFiClient reference — this is the ESP8266-correct form
-  bool begun = http.begin(wifiClient, serverUrl);
-  if (!begun) {
-    Serial.println("[HTTP] http.begin() failed — check URL format");
-    return;
-  }
-
-  // Headers
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-client-secret", clientSecret);
-
-  // Build JSON payload
-  unsigned long timestampMs = millis();  // substitute with NTP epoch ms if you add time sync
   String payload = "{";
-  payload += "\"device_id\":\"" + String(deviceId) + "\",";
-  payload += "\"timestamp_ms\":" + String(timestampMs) + ",";
+  payload += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
+  payload += "\"timestamp_ms\":" + String(millis()) + ",";
   payload += "\"temperature_c\":" + String(tempC, 2);
   payload += "}";
 
-  Serial.print("[HTTP] POST payload: ");
-  Serial.println(payload);
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.begin(wifiClient, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-client-secret", CLIENT_SECRET);
 
-  Serial.println("Waiting for network stack to settle...");
-  delay(2000);
-  int httpCode = http.POST(payload);
+  Serial.printf("[HTTP] POST %s  payload: %s\n", url.c_str(), payload.c_str());
 
-  // httpCode < 0 means a transport-level error (DNS, connection refused, timeout)
-  if (httpCode > 0) {
-    Serial.printf("[HTTP] Response code: %d\n", httpCode);
-    String response = http.getString();
-    Serial.print("[HTTP] Response body: ");
-    Serial.println(response);
+  int code = http.POST(payload);
+  if (code > 0) {
+    Serial.printf("[HTTP] %d  %s\n", code, http.getString().c_str());
   } else {
-    Serial.printf("[HTTP] POST failed, error: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("[HTTP] Error: %s\n", http.errorToString(code).c_str());
   }
 
   http.end();
-  Serial.println("[HTTP] Connection closed");
+}
+
+// ── Setup / Loop ─────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n=== ESP8266 DS18B20 HTTP POST ===");
+
+  connectWiFi();
+
+  rawDnsTest();
+  sensors.begin();
+  Serial.printf("DS18B20 devices found: %d\n", sensors.getDeviceCount());
 }
 
 void loop() {
   sensors.requestTemperatures();
-  float temperatureC = sensors.getTempCByIndex(0);
+  float tempC = sensors.getTempCByIndex(0);
 
-  // -127 means read failure
-  if (temperatureC == DEVICE_DISCONNECTED_C) {
-    Serial.println("[SENSOR] Read failed (-127). Check wiring.");
+  if (tempC == DEVICE_DISCONNECTED_C) {
+    Serial.println("[SENSOR] Read failed. Check wiring on GPIO14 (D5).");
   } else {
-    Serial.printf("[SENSOR] Temperature: %.2f °C\n", temperatureC);
-    postTemperature(temperatureC);
+    Serial.printf("[SENSOR] %.2f °C\n", tempC);
+    postTemperature(tempC);
   }
 
-  delay(5000);
+  delay(LOOP_DELAY_MS);
 }
