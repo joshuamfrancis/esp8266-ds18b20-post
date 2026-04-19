@@ -13,7 +13,7 @@ const char* SERVER_DOMAIN   = "labpc.home";
 const char* SERVER_PATH     = "/sensors";
 const int   SERVER_PORT     = 8000;
 
-const char* CLIENT_SECRET   = "ce0eb3fe21a3a17b21cc";
+const char* CLIENT_SECRET   = "xxxxxxx"; // Must match server's expected value
 const char* DEVICE_ID       = "esp8266d1-ds18b20-01";
 
 const int   TEMP_PIN        = 14;   // GPIO14 = D5 on Wemos D1 Mini
